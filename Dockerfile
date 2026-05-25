@@ -53,12 +53,11 @@ RUN git clone https://github.com/bytedance/LatentSync.git /code/LatentSync && \
 RUN pip install --upgrade pip setuptools wheel && \
     pip install Cython numpy
 
-# Stage 2: LatentSync deps. We split insightface out and install it with --no-build-isolation
-# so it uses the Cython/numpy we just installed instead of an isolated env that doesn't have them.
-RUN pip install --no-build-isolation insightface==0.7.3 || \
-    pip install --no-build-isolation insightface
-
-RUN pip install -r /code/LatentSync/requirements.txt
+# Stage 2: LatentSync deps. We pass --no-build-isolation to the WHOLE requirements.txt
+# so insightface (and any other pyproject.toml-based package) can see the Cython/numpy
+# we installed in Stage 1 instead of getting a clean isolated env without them.
+# This is safe because Stage 1 already covers all common build deps (Cython, numpy, setuptools, wheel).
+RUN pip install --no-build-isolation -r /code/LatentSync/requirements.txt
 
 # Stage 3: our wrapper deps.
 RUN pip install fastapi "uvicorn[standard]" python-multipart huggingface_hub
