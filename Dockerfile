@@ -47,11 +47,20 @@ RUN git clone https://github.com/bytedance/LatentSync.git /code/LatentSync && \
 
 # Install Python deps in stages so a failure points to the exact step.
 # LatentSync's requirements.txt is the source of truth for torch + diffusers + face libs.
-# We don't pre-install torch separately to avoid version conflicts with their pin.
-RUN pip install --upgrade pip setuptools wheel
+
+# Stage 1: build tooling — required BEFORE insightface so its pyproject.toml build doesn't fail.
+# insightface needs Cython + numpy at build time; if pip doesn't see them, the wheel build dies.
+RUN pip install --upgrade pip setuptools wheel && \
+    pip install Cython numpy
+
+# Stage 2: LatentSync deps. We split insightface out and install it with --no-build-isolation
+# so it uses the Cython/numpy we just installed instead of an isolated env that doesn't have them.
+RUN pip install --no-build-isolation insightface==0.7.3 || \
+    pip install --no-build-isolation insightface
 
 RUN pip install -r /code/LatentSync/requirements.txt
 
+# Stage 3: our wrapper deps.
 RUN pip install fastapi "uvicorn[standard]" python-multipart huggingface_hub
 
 # Our FastAPI wrapper exposing /easy/submit and /easy/query (HeyGem-compatible).
