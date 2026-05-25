@@ -45,13 +45,14 @@ RUN git clone https://github.com/bytedance/LatentSync.git /code/LatentSync && \
     cd /code/LatentSync && \
     git checkout main
 
-# Install Python deps. LatentSync's requirements.txt covers torch + diffusers + face libs.
-# We add fastapi/uvicorn for our HTTP wrapper.
-RUN pip install --upgrade pip && \
-    pip install \
-        torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121 && \
-    pip install -r /code/LatentSync/requirements.txt && \
-    pip install fastapi uvicorn[standard] python-multipart
+# Install Python deps in stages so a failure points to the exact step.
+# LatentSync's requirements.txt is the source of truth for torch + diffusers + face libs.
+# We don't pre-install torch separately to avoid version conflicts with their pin.
+RUN pip install --upgrade pip setuptools wheel
+
+RUN pip install -r /code/LatentSync/requirements.txt
+
+RUN pip install fastapi "uvicorn[standard]" python-multipart huggingface_hub
 
 # Our FastAPI wrapper exposing /easy/submit and /easy/query (HeyGem-compatible).
 COPY server.py /code/server.py
