@@ -1,48 +1,72 @@
 #!/bin/bash
 # Adnan Clone Studio — LatentSync pod entrypoint
-# 1) Inject SSH public key from PUBLIC_KEY env var (so Next.js can SCP files in)
-# 2) Start sshd in background
-# 3) Download LatentSync weights to /workspace cache if not present (first boot only)
-# 4) Start FastAPI server on port 8383 (HeyGem-compatible API)
+# Bulletproof version after iterating on disk-quota issues:
+# - ALL caches forced to /workspace volume (HF_HOME, HF_HUB_CACHE, TMPDIR, XDG_CACHE_HOME)
+# - Explicitly rm -rf the checkpoints dir before symlinking so we don't end up with a nested dir
+# - local_dir_use_symlinks=False so HF doesn't double-store (cache + local_dir)
+# - Diagnostic df -h + ls -la so we can see what's happening in the pod logs
 set -e
 
-# --- 1. SSH key setup ---
+# --- 1. SSH key setup (so Next.js can SCP files in) ---
 if [ -n "$PUBLIC_KEY" ]; then
   echo "[entrypoint] Setting up SSH key from PUBLIC_KEY env"
   echo "$PUBLIC_KEY" > /root/.ssh/authorized_keys
   chmod 600 /root/.ssh/authorized_keys
 else
-  echo "[entrypoint] WARNING: PUBLIC_KEY env not set — SSH will not be accessible"
+  echo "[entrypoint] WARNING: PUBLIC_KEY env not set"
 fi
-
-# --- 2. Start sshd ---
-echo "[entrypoint] Starting sshd"
 /usr/sbin/sshd
+echo "[entrypoint] sshd started"
 
-# --- 3. Ensure LatentSync checkpoints exist (cached on /workspace volume across boots) ---
-CKPT_DIR=/code/LatentSync/checkpoints
-WORKSPACE_CKPT=/workspace/latentsync_checkpoints
+# --- 2. Diagnostic — print disk state so we know what's mounted ---
+echo "[entrypoint] === Disk state ==="
+df -h
+echo "[entrypoint] === /workspace ==="
+ls -la /workspace 2>/dev/null || echo "[entrypoint] WARN: /workspace not accessible!"
+echo "[entrypoint] === /code/LatentSync ==="
+ls -la /code/LatentSync 2>/dev/null | head -20
 
-mkdir -p "$WORKSPACE_CKPT"
-ln -sfn "$WORKSPACE_CKPT" "$CKPT_DIR"
+# --- 3. Force EVERY cache to /workspace volume (50 GB) so nothing fills container disk ---
+mkdir -p /workspace/tmp \
+         /workspace/.cache/huggingface \
+         /workspace/.cache/huggingface/hub \
+         /workspace/latentsync_checkpoints \
+         /workspace/.insightface
+export TMPDIR=/workspace/tmp
+export HF_HOME=/workspace/.cache/huggingface
+export HF_HUB_CACHE=/workspace/.cache/huggingface/hub
+export XDG_CACHE_HOME=/workspace/.cache
+echo "[entrypoint] TMPDIR=$TMPDIR  HF_HOME=$HF_HOME"
 
-if [ ! -f "$CKPT_DIR/latentsync_unet.pt" ]; then
-  echo "[entrypoint] First boot: downloading LatentSync weights (~5 GB, ~3-5 min)..."
-  cd /code/LatentSync
-  # LatentSync provides a download script that fetches from HuggingFace.
-  # Falls back to direct hf-cli pull if the helper script changes.
-  if [ -f "scripts/download_checkpoints.py" ]; then
-    python scripts/download_checkpoints.py || \
-      python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='ByteDance/LatentSync-1.6', local_dir='$CKPT_DIR')"
-  else
-    python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='ByteDance/LatentSync-1.6', local_dir='$CKPT_DIR')"
-  fi
-  echo "[entrypoint] Weights downloaded to $CKPT_DIR (persists on /workspace volume)"
+# Insightface stores its face-detection models under ~/.insightface — symlink to volume.
+rm -rf /root/.insightface
+ln -s /workspace/.insightface /root/.insightface
+
+# --- 4. Force LatentSync checkpoints dir to be a symlink to /workspace ---
+# Critical: remove ANY existing dir/symlink first. ln -sfn alone fails if a non-empty dir exists.
+rm -rf /code/LatentSync/checkpoints
+ln -s /workspace/latentsync_checkpoints /code/LatentSync/checkpoints
+echo "[entrypoint] checkpoints symlink: $(ls -la /code/LatentSync/checkpoints)"
+
+# --- 5. Download LatentSync weights if not already cached on volume ---
+CKPT_FILE=/workspace/latentsync_checkpoints/latentsync_unet.pt
+if [ ! -f "$CKPT_FILE" ]; then
+  echo "[entrypoint] First boot: downloading LatentSync weights (~5 GB) to /workspace..."
+  python -c "
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id='ByteDance/LatentSync-1.6',
+    local_dir='/workspace/latentsync_checkpoints',
+    local_dir_use_symlinks=False,
+)
+print('[entrypoint] snapshot_download complete')
+"
+  echo "[entrypoint] Downloaded — checkpoint size: $(du -sh /workspace/latentsync_checkpoints | cut -f1)"
 else
-  echo "[entrypoint] Weights already cached at $CKPT_DIR — skipping download"
+  echo "[entrypoint] Weights cached on volume: $CKPT_FILE"
 fi
 
-# --- 4. Start FastAPI server ---
+# --- 6. Start FastAPI server on port 8383 ---
 echo "[entrypoint] Starting LatentSync FastAPI server on port 8383"
 cd /code
 exec python /code/server.py
